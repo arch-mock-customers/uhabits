@@ -1,0 +1,85 @@
+# The mock customer's one workflow: build the debug APK for each arch-qa PR and each default-branch
+# commit, publish it as a release asset, and report it to Arch with the Arch Action.
+# Per-repo settings are Actions variables: ARCH_APP_NAME, ARCH_GRADLE_TASK, ARCH_APK_GLOB,
+# ARCH_JAVA (default 21), ARCH_API_URL (empty: build only), ARCH_REPORT_MAIN ('true' to report
+# default-branch builds). Secret: ARCH_DEPLOYMENT_TOKEN.
+name: Arch QA build
+
+on:
+  pull_request:
+    types: [labeled, synchronize]
+  push:
+    branches-ignore: ['replay/**']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: read
+  deployments: read
+
+concurrency:
+  group: arch-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'push' && github.ref_name == github.event.repository.default_branch)
+      || (github.event_name == 'pull_request'
+          && contains(github.event.pull_request.labels.*.name, 'arch-qa')
+          && (github.event.action != 'labeled' || github.event.label.name == 'arch-qa'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ vars.ARCH_JAVA || '21' }}
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build the debug APK
+        run: ./gradlew --no-daemon ${{ vars.ARCH_GRADLE_TASK }}
+      - name: Publish the APK
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          apk=$(ls ${{ vars.ARCH_APK_GLOB }} | head -1)
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            name="${{ vars.ARCH_APP_NAME }}-pr${{ github.event.pull_request.number }}-${SHA::7}.apk"
+          else
+            name="${{ vars.ARCH_APP_NAME }}-main-${SHA::7}.apk"
+          fi
+          cp "$apk" "$name"
+          gh release view builds >/dev/null 2>&1 || gh release create builds --prerelease \
+            --title "Builds" --notes "Debug APKs, one per PR and per default-branch commit." --target "$SHA"
+          gh release upload builds "$name" --clobber
+          echo "url=https://github.com/${{ github.repository }}/releases/download/builds/$name" >> "$GITHUB_OUTPUT"
+          echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "APK: https://github.com/${{ github.repository }}/releases/download/builds/$name" >> "$GITHUB_STEP_SUMMARY"
+      - name: Report the PR build to Arch
+        if: github.event_name == 'pull_request' && vars.ARCH_API_URL != ''
+        uses: arch-mock-customers/arch-action@api-url
+        with:
+          arch-token: ${{ secrets.ARCH_DEPLOYMENT_TOKEN }}
+          api-url: ${{ vars.ARCH_API_URL }}
+          mode: preview
+          preview-url: ${{ steps.publish.outputs.url }}
+          deployed-sha: ${{ github.event.pull_request.head.sha }}
+          deployment-id: build-${{ github.run_id }}
+      - name: Report the default-branch build to Arch
+        if: github.event_name == 'push' && vars.ARCH_API_URL != '' && vars.ARCH_REPORT_MAIN == 'true'
+        uses: arch-mock-customers/arch-action@api-url
+        with:
+          arch-token: ${{ secrets.ARCH_DEPLOYMENT_TOKEN }}
+          api-url: ${{ vars.ARCH_API_URL }}
+          mode: deploy
+          deployed-sha: ${{ github.sha }}
+          deployment-id: main-${{ github.run_id }}
+          deployed-at: ${{ steps.publish.outputs.at }}
+          deployment-order: ${{ github.run_number }}
